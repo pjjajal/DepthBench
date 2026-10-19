@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 __all__ = [
+    "CGHCHyperConnection",
     "HyperConnection",
     "HyperConnectionStreamExpand",
     "HyperConnectionStreamReduce",
@@ -538,3 +539,109 @@ class HyperConnection(nn.Module):
         if self.kind == "mhc_static":
             return self._forward_mhc_static(residuals, *args, **kwargs)
         return self._forward_mhc(residuals, *args, **kwargs)
+
+
+class CGHCHyperConnection(nn.Module):
+    """Continuous generator hyper-connection (``hyperconnections.cghc``) with ``m=1``.
+
+    The transformer keeps residual streams folded into the batch dimension with shape
+    ``(batch_size * num_streams, seq_len, d_model)``. CGHC operates on streams concatenated
+    along the feature dimension, ``(batch_size, seq_len, num_streams * d_model)``, so this
+    module reshapes only around the connector.
+
+    CGHC's own initializer must run after OLMo-core's generic ``reset_parameters()`` pass,
+    which would otherwise leave its parameters uninitialized after ``to_empty()`` and reset
+    the zero-initialized slices of its fused input projection. The model calls
+    :meth:`init_connector_weights` for that.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_residual_streams: int,
+        dim: int,
+        branch: Optional[nn.Module],
+        init_device: str = "cpu",
+        dtype: Optional[torch.dtype] = None,
+        **cghc_kwargs: Any,
+    ):
+        super().__init__()
+        try:
+            from hyperconnections.cghc import ContinuousGenHyperConnections
+            from hyperconnections.ops import HAS_TRITON
+        except ImportError as exc:
+            raise ImportError(
+                "CGHC blocks require the 'hyperconnections' package "
+                "(pip install --no-deps -e hyperconnections)"
+            ) from exc
+
+        self.num_residual_streams = num_residual_streams
+        self.dim = dim
+        self.use_triton = bool(cghc_kwargs.get("use_triton", True)) and HAS_TRITON
+        # With a feedback budget, the connector threads a running gain bound between connectors
+        # (see hyperconnections.cghc_fb) and forward takes and returns it with the streams.
+        feedback_budget = cghc_kwargs.pop("feedback_budget", None)
+        feedback_refill = cghc_kwargs.pop("feedback_refill", False)
+        forced = cghc_kwargs.pop("forced", False)
+        self.feedback = feedback_budget is not None
+        cghc_cls = ContinuousGenHyperConnections
+        if forced:
+            from hyperconnections.cghcf import ContinuousGenHyperConnectionsForced
+
+            cghc_cls = ContinuousGenHyperConnectionsForced
+        if self.feedback:
+            from hyperconnections.cghc_fb import ContinuousGenHyperConnectionsFeedback
+
+            cghc_cls = ContinuousGenHyperConnectionsFeedback
+            cghc_kwargs["inflow_budget"] = feedback_budget
+            cghc_kwargs["refill"] = feedback_refill
+        with torch.device(init_device):
+            self.cghc = cghc_cls(
+                n=num_residual_streams,
+                m=1,
+                input_dim=num_residual_streams * dim,
+                embed_dim=dim,
+                module=branch if branch is not None else nn.Identity(),
+                **cghc_kwargs,
+            )
+        if dtype is not None:
+            # Match the block's parameter dtype like the other connectors; the branch already has it.
+            for name, tensor in [*self.cghc.named_parameters(), *self.cghc.named_buffers()]:
+                if not name.startswith("module."):
+                    tensor.data = tensor.data.to(dtype)
+
+    def no_decay_parameter_names(self) -> list[str]:
+        """Connector parameters CGHC excludes from weight decay, relative to this module."""
+        anchors = self.cghc.NO_DECAY_PARAM_NAMES
+        return [
+            name
+            for name, param in self.named_parameters()
+            if not name.startswith("cghc.module.")
+            and (param.ndim <= 1 or name.rsplit(".", 1)[-1] in anchors)
+        ]
+
+    @torch.no_grad()
+    def init_connector_weights(self):
+        self.cghc.init_weights()
+        # TemporalWriteback initializes only in __init__, which to_empty() discards.
+        writeback = self.cghc.writeback
+        if writeback is not None:
+            for weight, kernel_size in zip(writeback.weights, writeback.kernel_sizes):
+                bound = 1.0 / math.sqrt(kernel_size)
+                nn.init.uniform_(weight, -bound, bound)
+
+    def forward(
+        self, residuals: torch.Tensor, gain: Optional[torch.Tensor] = None, **kwargs: Any
+    ):
+        """Mix the folded streams. With a feedback budget, returns ``(streams, gain)``, where
+        ``gain`` is the per-token running gain bound of shape ``(batch_size, seq_len)``."""
+        # CGHC's Triton kernels are CUDA-only; fall back to its PyTorch path elsewhere.
+        self.cghc._use_triton = self.use_triton and residuals.is_cuda
+        streams = _reshape_to_streams(residuals, self.num_residual_streams)
+        stream_shape = streams.shape
+        flat = streams.reshape(*stream_shape[:-2], self.num_residual_streams * self.dim)
+        if self.feedback:
+            output, gain = self.cghc(flat, gain, **kwargs)
+            return _flatten_from_streams(output.view(stream_shape)), gain
+        output = self.cghc(flat, **kwargs)
+        return _flatten_from_streams(output.view(stream_shape))

@@ -287,9 +287,15 @@ def _swap_pairs(model, i: int, j: int) -> list[tuple[torch.Tensor, torch.Tensor]
     state_i = layers[i].state_dict()
     state_j = layers[j].state_dict()
     pairs = []
+    seen = set()
     for name, tensor_i in state_i.items():
         if family == ATTNRES and _is_attnres_input_mixer(name):
             continue
+        # HC / mHC / CGHC connectors also expose the block's branch weights under a second
+        # name; swapping an alias twice would restore it.
+        if tensor_i.data_ptr() in seen:
+            continue
+        seen.add(tensor_i.data_ptr())
         tensor_j = state_j.get(name)
         # Structurally different keys (e.g. KEEL block 0 has no post-attention norm) stay in place.
         if tensor_j is not None and tensor_j.shape == tensor_i.shape:

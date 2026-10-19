@@ -535,6 +535,12 @@ class HyperConnectionsTransformerBlock(TransformerBlockBase):
         **kwargs,
     ) -> torch.Tensor:
         del loss_div_factor
+        if getattr(self.attention_hyper_connection, "feedback", False):
+            # CGHC feedback: carry (streams, gain) between connectors and blocks. The first block
+            # receives plain streams, and the gain starts at 1.
+            x, gain = x if isinstance(x, tuple) else (x, None)
+            h, gain = self.attention_hyper_connection(x, gain=gain, **kwargs)
+            return self.feed_forward_hyper_connection(h, gain=gain)
         h = self.attention_hyper_connection(x, **kwargs)
         return self.feed_forward_hyper_connection(h)
 
@@ -592,6 +598,12 @@ class MHCTransformerBlock(HyperConnectionsTransformerBlock):
             HyperConnectionsKind.liger_mhc,
         }
     )
+
+
+class CGHCTransformerBlock(HyperConnectionsTransformerBlock):
+    """Transformer block using continuous generator hyper-connections (CGHC) routing."""
+
+    allowed_kinds = frozenset({HyperConnectionsKind.cghc})
 
 
 class DepthScaledTransformerBlock(TransformerBlock):

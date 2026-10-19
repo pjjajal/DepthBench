@@ -10,6 +10,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _OLMO_CORE_SRC = _REPO_ROOT / "pretrain" / "OLMo-core" / "src"
 if str(_OLMO_CORE_SRC) not in sys.path:
     sys.path.insert(0, str(_OLMO_CORE_SRC))
+if str(_REPO_ROOT / "analysis") not in sys.path:
+    sys.path.append(str(_REPO_ROOT / "analysis"))
 
 import torch
 import torch.nn.functional as F
@@ -138,6 +140,13 @@ class OLMoNativeLM:
         from lm_eval.api.model import TemplateLM
 
         checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
+        if transformer_config is None:
+            # Same config fixes as the analyses (e.g. older AttnRes checkpoints stored as `default`).
+            from analysis_utils import normalize_experiment_config
+            from olmo_core.nn.transformer import TransformerConfig
+
+            config_dict = normalize_experiment_config(_load_checkpoint_config(checkpoint_dir))
+            transformer_config = TransformerConfig.from_dict(config_dict["model"])
         tokenizer = _load_hf_tokenizer(checkpoint_dir, tokenizer_name_or_path)
         tokenizer_cfg = _load_tokenizer_config(checkpoint_dir)
         resolved_device = torch.device(device) if device is not None else get_default_device()

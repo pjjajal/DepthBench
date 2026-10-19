@@ -166,6 +166,11 @@ class TransformerBlockType(StrEnum):
     ➡️ :class:`MHCTransformerBlock`.
     """
 
+    cghc = "cghc"
+    """
+    ➡️ :class:`CGHCTransformerBlock`.
+    """
+
     keel = "keel"
     """
     ➡️ :class:`KeelTransformerBlock`.
@@ -214,6 +219,80 @@ class HyperConnectionsKind(StrEnum):
     mhc = "mhc"
     mhc_static = "mhc_static"
     liger_mhc = "liger_mhc"
+    cghc = "cghc"
+
+
+@dataclass
+class CGHCConfig(Config):
+    """Options for continuous generator hyper-connections (``hyperconnections.cghc``).
+
+    Defaults are the tuned CGHC recipe without temporal write-back, which would add token
+    mixing absent from HC / mHC. The connector always uses ``m=1``, so each of the
+    ``num_residual_streams`` streams has width ``d_model`` as in HC / mHC.
+    """
+
+    generator_type: str = "conservative_diag_diss"
+    projection: str = "v"
+    projection_variant: str = "one_sided"
+    projection_decay: float = 0.99
+    dt: float = 0.015
+    dt_min: float = 0.0001
+    dt_max: float = 0.35
+    dt_max_diss: Optional[float] = 0.35
+    learn_dt: bool = True
+    vec_dt: bool = True
+    sat_c: Optional[float] = 10.0
+    init_transition_contraction: Optional[float] = 0.95
+    bias: bool = False
+    elementwise_affine: bool = True
+    use_triton: bool = True
+    writeback_kernel_sizes: List[int] = field(default_factory=list)
+    writeback_orthogonalize: bool = True
+    projection_inflow: float = 0.0
+    """
+    Initial inflow weight ``gamma`` for ``projection_variant="inflow"``, which mixes
+    ``d P + gamma P T Q + Q T Q`` (two-sided at ``gamma = 0``, one-sided at ``gamma = 1``).
+    ``gamma`` is input-dependent, in ``(-inflow_max, inflow_max)`` via tanh.
+    """
+    inflow_max: float = 1.0
+    feedback_budget: Optional[float] = None
+    """
+    With ``projection_variant="inflow"``, cap the amplification of any stack of sublayers at this
+    value by threading a running gain bound between connectors and clipping each connector's
+    inflow to fit (``hyperconnections.cghc_fb``). ``None`` disables the feedback.
+    """
+    feedback_refill: bool = False
+    """
+    With ``feedback_budget`` and diagonal dissipation, charge each step the damping-aware bound
+    so damped steps give budget back (``refill=True`` in ``hyperconnections.cghc_fb``).
+    """
+    read_init: str = "rotating"
+    """
+    ``"rotating"`` starts each sublayer reading one stream, ``layer_index % n``, as mHC's gap-8
+    init does. ``"uniform"`` starts every read at ``1/n`` (the original CGHC init).
+    """
+    forced: bool = False
+    """
+    Integrate the branch output as a constant source over each step, writing back through
+    ``phi_1(A)`` with the projection structure of the transition (``hyperconnections.cghcf``).
+    """
+
+    def __post_init__(self):
+        if self.read_init not in {"rotating", "uniform"}:
+            raise OLMoConfigurationError("'read_init' for CGHC must be 'rotating' or 'uniform'")
+        if self.forced and self.feedback_budget is not None:
+            raise OLMoConfigurationError("CGHC 'forced' does not support 'feedback_budget'")
+        if self.feedback_refill and self.feedback_budget is None:
+            raise OLMoConfigurationError("CGHC 'feedback_refill' requires 'feedback_budget'")
+        if self.feedback_budget is not None and self.projection_variant != "inflow":
+            raise OLMoConfigurationError("CGHC 'feedback_budget' requires projection_variant='inflow'")
+
+    def connector_kwargs(self, layer_index: int, num_streams: int) -> Dict:
+        kwargs = self.as_dict()
+        kwargs["writeback_kernel_sizes"] = tuple(kwargs["writeback_kernel_sizes"])
+        read_init = kwargs.pop("read_init")
+        kwargs["read_stream"] = layer_index % num_streams if read_init == "rotating" else None
+        return kwargs
 
 
 @dataclass
@@ -235,10 +314,16 @@ class HyperConnectionsConfig(Config):
     liger_sinkhorn_eps: float = 1e-6
     liger_post_mult: float = 2.0
     collapse: str = "auto"
+    cghc: Optional[CGHCConfig] = None
+    """Connector options, used only when ``kind='cghc'``."""
 
     def __post_init__(self):
         if isinstance(self.kind, str):
             self.kind = HyperConnectionsKind(self.kind)
+        if self.kind == HyperConnectionsKind.cghc and self.cghc is None:
+            self.cghc = CGHCConfig()
+        if self.kind != HyperConnectionsKind.cghc and self.cghc is not None:
+            raise OLMoConfigurationError("'cghc' options require hyper_connections.kind='cghc'")
         if isinstance(self.liger_phi_dtype, str):
             self.liger_phi_dtype = DType(self.liger_phi_dtype)
         if self.num_residual_streams < 1:
@@ -259,7 +344,22 @@ class HyperConnectionsConfig(Config):
         init_device: str,
         dtype,
     ):
-        from ..hyper_connections import HyperConnection, LigerHyperConnection
+        from ..hyper_connections import (
+            CGHCHyperConnection,
+            HyperConnection,
+            LigerHyperConnection,
+        )
+
+        if self.kind == HyperConnectionsKind.cghc:
+            assert self.cghc is not None
+            return CGHCHyperConnection(
+                num_residual_streams=self.num_residual_streams,
+                dim=dim,
+                branch=branch,
+                init_device=init_device,
+                dtype=dtype,
+                **self.cghc.connector_kwargs(layer_index, self.num_residual_streams),
+            )
 
         if self.kind == HyperConnectionsKind.liger_mhc:
             return LigerHyperConnection(
@@ -301,6 +401,8 @@ class HyperConnectionsConfig(Config):
             return (n * n) + n + n
         if self.kind == HyperConnectionsKind.liger_mhc:
             return (d_model * n * ((n * n) + (2 * n))) + ((n * n) + (2 * n)) + 3
+        if self.kind == HyperConnectionsKind.cghc:
+            return sum(p.numel() for p in self._cghc_probe(d_model).parameters())
 
         flat_dim = d_model * n
         return (flat_dim * n) + (flat_dim * n) + (flat_dim * n * n) + 3 + n + n + (n * n)
@@ -312,9 +414,24 @@ class HyperConnectionsConfig(Config):
             names = ("H_res_logits", "H_pre_logits", "H_post_logits")
         elif self.kind == HyperConnectionsKind.liger_mhc:
             names = ("b", "alpha_pre", "alpha_post", "alpha_res")
+        elif self.kind == HyperConnectionsKind.cghc:
+            names = tuple(self._cghc_probe(d_model=64).no_decay_parameter_names())
         else:
             names = ("pre_bias", "post_bias", "residual_bias")
         return [f"{module_pattern}.{name}" for name in names]
+
+    def _cghc_probe(self, d_model: int):
+        """A branch-less CGHC connector on the meta device, for parameter bookkeeping."""
+        from ..hyper_connections import CGHCHyperConnection
+
+        assert self.cghc is not None
+        return CGHCHyperConnection(
+            num_residual_streams=self.num_residual_streams,
+            dim=d_model,
+            branch=None,
+            init_device="meta",
+            **self.cghc.connector_kwargs(layer_index=0, num_streams=self.num_residual_streams),
+        )
 
     @property
     def use_tanh(self) -> bool:
@@ -327,7 +444,11 @@ class HyperConnectionsConfig(Config):
     @property
     def reduce_mode(self) -> str:
         if self.collapse == "auto":
-            return "mean" if self.kind == HyperConnectionsKind.liger_mhc else "sum"
+            return (
+                "mean"
+                if self.kind in {HyperConnectionsKind.liger_mhc, HyperConnectionsKind.cghc}
+                else "sum"
+            )
         return self.collapse
 
 
@@ -448,6 +569,7 @@ class TransformerBlockConfig(ModuleConfig):
     ) -> "TransformerBlockBase":
         from .block import (
             AttnResTransformerBlock,
+            CGHCTransformerBlock,
             DeepNormTransformerBlock,
             DepthScaledTransformerBlock,
             HCTransformerBlock,
@@ -475,8 +597,11 @@ class TransformerBlockConfig(ModuleConfig):
         if hyper_connections is not None and self.name not in {
             TransformerBlockType.hc,
             TransformerBlockType.mhc,
+            TransformerBlockType.cghc,
         }:
-            raise OLMoConfigurationError("'hyper_connections' is only valid for HC and mHC blocks")
+            raise OLMoConfigurationError(
+                "'hyper_connections' is only valid for HC, mHC and CGHC blocks"
+            )
         moda = kwargs.pop("moda", None)
         moda_skip_ffn_kv = kwargs.pop("moda_skip_ffn_kv", False)
         if (moda is not None or moda_skip_ffn_kv) and self.name not in {
@@ -547,6 +672,13 @@ class TransformerBlockConfig(ModuleConfig):
                         "mHC blocks require kind 'mhc', 'mhc_static', or 'liger_mhc'"
                     )
                 return MHCTransformerBlock(hyper_connections=hyper_connections, **kwargs)
+            elif self.name == TransformerBlockType.cghc:
+                hyper_connections = hyper_connections or HyperConnectionsConfig(
+                    kind=HyperConnectionsKind.cghc
+                )
+                if hyper_connections.kind != HyperConnectionsKind.cghc:
+                    raise OLMoConfigurationError("CGHC blocks require hyper_connections.kind='cghc'")
+                return CGHCTransformerBlock(hyper_connections=hyper_connections, **kwargs)
             elif self.name == TransformerBlockType.keel:
                 return KeelTransformerBlock(**kwargs)
             elif self.name == TransformerBlockType.default_scaled:
@@ -603,15 +735,19 @@ class TransformerBlockConfig(ModuleConfig):
             assert self.layer_norm is not None
             block_params += 2 * self.layer_norm.num_params(d_model)
 
-        if self.name in {TransformerBlockType.hc, TransformerBlockType.mhc}:
+        if self.name in {
+            TransformerBlockType.hc,
+            TransformerBlockType.mhc,
+            TransformerBlockType.cghc,
+        }:
             hyper_connections = self.hyper_connections
             if hyper_connections is None:
                 hyper_connections = HyperConnectionsConfig(
-                    kind=(
-                        HyperConnectionsKind.hc
-                        if self.name == TransformerBlockType.hc
-                        else HyperConnectionsKind.mhc
-                    )
+                    kind={
+                        TransformerBlockType.hc: HyperConnectionsKind.hc,
+                        TransformerBlockType.mhc: HyperConnectionsKind.mhc,
+                        TransformerBlockType.cghc: HyperConnectionsKind.cghc,
+                    }[self.name]
                 )
             block_params += 2 * hyper_connections.num_params(d_model)
         if self.name == TransformerBlockType.keel:

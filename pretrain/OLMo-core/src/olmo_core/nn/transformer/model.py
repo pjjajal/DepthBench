@@ -336,6 +336,10 @@ class Transformer(nn.Module):
         for module in self.modules():
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()  # type: ignore
+        # Connectors whose own initializer must follow the generic child resets (CGHC).
+        for module in self.modules():
+            if hasattr(module, "init_connector_weights"):
+                module.init_connector_weights()  # type: ignore
 
         seed = self.init_seed
         if world_mesh is not None and self.pp_enabled:
@@ -654,7 +658,7 @@ class Transformer(nn.Module):
                     f"block_{block_idx:02d}", h_for_stats
                 )
                 if isinstance(h, tuple):
-                    h = (observed_h, h[1], h[2])
+                    h = (observed_h, *h[1:])
                 else:
                     h = observed_h
 

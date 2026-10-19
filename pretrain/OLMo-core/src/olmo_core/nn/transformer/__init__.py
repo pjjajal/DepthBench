@@ -2,6 +2,7 @@ from .block import (
     AttnResTransformerBlock,
     DeepNormTransformerBlock,
     DepthScaledTransformerBlock,
+    CGHCTransformerBlock,
     HCTransformerBlock,
     HyperConnectionsTransformerBlock,
     KeelTransformerBlock,
@@ -23,6 +24,7 @@ from .block import (
     TransformerBlockBase,
 )
 from .config import (
+    CGHCConfig,
     HyperConnectionsConfig,
     HyperConnectionsKind,
     MoDAConfig,
@@ -50,8 +52,10 @@ __all__ = [
     "TransformerBlockBase",
     "TransformerBlock",
     "HyperConnectionsTransformerBlock",
+    "CGHCTransformerBlock",
     "HCTransformerBlock",
     "MHCTransformerBlock",
+    "CGHCConfig",
     "HyperConnectionsConfig",
     "HyperConnectionsKind",
     "PostNormTransformerBlock",
